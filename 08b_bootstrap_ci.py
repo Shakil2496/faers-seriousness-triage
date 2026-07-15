@@ -16,20 +16,26 @@ resamples the cases once per iteration and scores BOTH arms on that same
 resample, recording the difference. This is the correct test for a head-to-head
 comparison, and it is what the paper reports.
 
-A gap whose 95% CI excludes zero is statistically significant. Expected: five of
-the six drugs are significant. The exception is seladelpar (n=187, the smallest
-panel), where the interval marginally includes zero - reported honestly as
-limited power rather than evidence of no effect.
+A gap whose 95% CI excludes zero is statistically significant. FOUR of the six
+drugs are significant. The two exceptions are the two smallest gaps: suzetrigine
+(+0.057; CI -0.001 to +0.114) and seladelpar (n=187, the smallest panel; +0.076,
+CI -0.006 to +0.157). Both intervals marginally include zero while the point
+estimate stays positive - reported honestly as limited power rather than
+evidence of no effect, and consistent with the panel-wide pattern that the LLM
+adds least where the classical model already generalises well.
 
 Input:  faers_temporal_{train,test}.parquet, <slug>_suspect.json,
         llm_arm_full/<slug>_llm.json
-Output: printed CIs (Table 5 in the paper)
+Output: printed CIs (Table 5 in the paper), plus
+        outputs/llm_vs_classical.csv and outputs/panel_means.json (read by
+        09_figures.py to draw Figure 3)
 Runtime: a few minutes at N_BOOT=2000
 """
 
 import json
 import os
 from collections import Counter
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -42,6 +48,8 @@ from xgboost import XGBClassifier
 
 DATA_DIR = r"C:\Users\shaki\Downloads\faers_data"   # <-- set to your data path
 LLM_DIR = os.path.join(DATA_DIR, "llm_arm_full")
+OUT = Path(DATA_DIR) / "outputs"
+OUT.mkdir(exist_ok=True)
 
 N_BOOT = 2000
 SEED = 42
@@ -161,7 +169,7 @@ def main():
           f"{'gap (95% CI)':>26}")
     print("-" * 104)
 
-    gaps, ns, cls_aucs, llm_aucs = [], [], [], []
+    recs, gaps, ns, cls_aucs, llm_aucs = [], [], [], [], []
     for label, slug in PANEL:
         with open(os.path.join(LLM_DIR, f"{slug}_llm.json"), encoding="utf-8") as f:
             llm = json.load(f)
@@ -189,15 +197,19 @@ def main():
         c_auc, c_lo, c_hi = boot_auroc(y, p_cls)
         l_auc, l_lo, l_hi = boot_auroc(y, p_llm)
         gap, g_lo, g_hi = boot_gap(y, p_cls, p_llm)
-        sig = "*" if g_lo > 0 else " "
+        sig = g_lo > 0
+        star = "*" if sig else " "
         print(f"{label:<30}{f'{c_auc:.3f} ({c_lo:.3f}-{c_hi:.3f})':>24}"
               f"{f'{l_auc:.3f} ({l_lo:.3f}-{l_hi:.3f})':>24}"
-              f"{f'{gap:+.3f} ({g_lo:+.3f},{g_hi:+.3f}){sig}':>26}")
+              f"{f'{gap:+.3f} ({g_lo:+.3f},{g_hi:+.3f}){star}':>26}")
 
-        gaps.append(gap)
-        ns.append(len(y))
-        cls_aucs.append(c_auc)
-        llm_aucs.append(l_auc)
+        recs.append(dict(drug=label, slug=slug, n=int(len(y)),
+                         base_rate=float(y.mean()),
+                         auroc_classical=c_auc, classical_lo=c_lo, classical_hi=c_hi,
+                         auroc_llm=l_auc, llm_lo=l_lo, llm_hi=l_hi,
+                         gap=gap, gap_lo=g_lo, gap_hi=g_hi, significant=bool(sig)))
+        gaps.append(gap); ns.append(len(y))
+        cls_aucs.append(c_auc); llm_aucs.append(l_auc)
 
     print("-" * 104)
     print(f"{'MEAN (per-drug)':<30}{np.mean(cls_aucs):>24.3f}"
@@ -207,6 +219,18 @@ def main():
     print(f"{'MEAN (n-weighted)':<30}{wc:>24.3f}{wl:>24.3f}{wl - wc:>+26.3f}")
     print(f"\n  n = {sum(ns):,} cases across the six-drug panel")
     print("  * = 95% CI for the gap excludes zero (LLM significantly better)")
+
+    # ---- 3. persist for the figure step --------------------------------------
+    pd.DataFrame(recs).to_csv(OUT / "llm_vs_classical.csv", index=False)
+    means = dict(per_drug_classical=float(np.mean(cls_aucs)),
+                 per_drug_llm=float(np.mean(llm_aucs)),
+                 per_drug_gap=float(np.mean(gaps)),
+                 nweighted_classical=float(wc), nweighted_llm=float(wl),
+                 nweighted_gap=float(wl - wc), panel_n=int(sum(ns)),
+                 clinical_auroc=float(auc), clinical_auroc_lo=float(lo),
+                 clinical_auroc_hi=float(hi))
+    (OUT / "panel_means.json").write_text(json.dumps(means, indent=2))
+    print(f"\n  wrote {OUT/'llm_vs_classical.csv'} and {OUT/'panel_means.json'}")
     print("\nNext: 09_figures.py")
 
 
